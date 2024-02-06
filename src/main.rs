@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{SeekFrom, Seek};
 
@@ -5,7 +6,7 @@ use anyhow::{ensure, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::index::Index;
-use crate::util::try_read_to_string;
+use crate::util::{try_read_to_string};
 
 pub mod index;
 pub mod util;
@@ -17,6 +18,9 @@ struct CreateCommand {
 
     #[arg(short, long)]
     pub name: Option<String>,
+
+    #[arg(long)]
+    pub no_hash: bool,
 }
 
 #[derive(Clone, Args, Debug)]
@@ -54,9 +58,11 @@ fn create(args: &CommandInvocation<CreateCommand>) -> Result<Index> {
         "Refusing to overwrite existing index!"
     );
 
-    let CreateCommand { ref name, ref path } = args.command;
-
-    let file_len = fs::File::open(path)?.seek(SeekFrom::End(0))?;
+    let CreateCommand { 
+        ref name,
+        ref path,
+        no_hash,
+    } = args.command;
 
     let dbg_canonical = match fs::canonicalize(path) {
         Ok(v) => format!("{:?}", v)
@@ -65,6 +71,24 @@ fn create(args: &CommandInvocation<CreateCommand>) -> Result<Index> {
             .to_owned(),
         Err(e) => format!("<Error: {:?}>", e),
     };
+
+    let mut file = fs::File::open(path)?;
+
+    let (hash, len) = if no_hash {
+        let len = file.seek(SeekFrom::End(0))?;
+        (None, len)
+    } else {
+        use sha3::digest::FixedOutput;
+        use base64::Engine;
+
+        let mut hasher = sha3::Sha3_256::default();
+        std::io::copy(&mut file, &mut hasher)?;
+        let hash = hasher.finalize_fixed();
+        let hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
+
+        (Some(hash), file.stream_position()?)
+    };
+
 
     let main_frag = Fragment {
         meta: Meta {
@@ -79,10 +103,16 @@ fn create(args: &CommandInvocation<CreateCommand>) -> Result<Index> {
             path: path.to_owned(),
         }
             .as_location(),
-        hashes: Default::default(),
+        hashes: {
+            let mut t = HashMap::new();
+            if let Some(hash) = hash {
+                t.insert(HashIdentifier::Sha3_256, hash);
+            }
+            t
+        },
         geometry: Slice {
             start: 0,
-            end: file_len,
+            end: len,
         },
         holes: vec![],
     };

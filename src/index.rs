@@ -21,7 +21,7 @@ pub struct Meta {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Hash, PartialEq, Eq)]
 pub enum HashIdentifier {
-    Sha3,
+    Sha3_256,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
@@ -209,7 +209,7 @@ pub struct Fragment {
     pub location: Location,
     #[serde(default)]
     #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub hashes: HashMap<HashIdentifier, Vec<u8>>,
+    pub hashes: HashMap<HashIdentifier, String>,
     #[serde(flatten)]
     pub geometry: Slice,
     #[serde(default)]
@@ -224,48 +224,4 @@ pub struct Index {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fragments: Vec<Fragment>,
-}
-
-impl Index {
-    pub fn from_file(path: &str) -> Result<Self> {
-        let file_len = fs::File::open(path)?.seek(SeekFrom::End(0))?;
-
-        let dbg_canonical = match fs::canonicalize(path) {
-            Ok(v) => format!("{:?}", v)
-                .trim_start_matches('"')
-                .trim_end_matches('"')
-                .to_owned(),
-            Err(e) => format!("<Error: {:?}>", e),
-        };
-
-        Ok(Index {
-            meta: Meta {
-                name: vec![],
-                comment: vec![
-                    format!("Relative path during creation: {path}"),
-                    format!("Canonical path during creation: {dbg_canonical}"),
-                ],
-            },
-            fragments: vec![Fragment {
-                meta: Meta {
-                    name: vec!["main".to_owned()],
-                    comment: vec![
-                        format!("Relative path during fragment creation: {path}"),
-                        format!("Canonical path during fragment creation: {dbg_canonical}"),
-                    ],
-                },
-                location: File {
-                    device: None,
-                    path: path.to_owned(),
-                }
-                .as_location(),
-                hashes: Default::default(),
-                geometry: Slice {
-                    start: 0,
-                    end: file_len,
-                },
-                holes: vec![],
-            }],
-        })
-    }
 }
