@@ -80,7 +80,7 @@ fn main() -> Result<()> {
         }
     };
 
-    fs::write(&cli.index, toml::to_string_pretty(&index)?)?;
+    fs::write(&cli.index, toml::to_string(&index)?)?;
 
     Ok(())
 }
