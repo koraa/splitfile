@@ -1,15 +1,14 @@
 use std::collections::HashMap;
 
 use std::fs;
-use std::io::{Seek, SeekFrom, Write, Result as IoResult, Read};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::process::{exit, ExitCode};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use sha3::digest::typenum::private::IsNotEqualPrivate;
 
 use crate::index::Index;
-use crate::util::{process_chunks, try_read_to_string, pretty_path, try_write_all, NullBuffer};
+use crate::util::{pretty_path, process_chunks, try_read_to_string, try_write_all, NullBuffer};
 
 pub mod index;
 pub mod util;
@@ -213,13 +212,16 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
     // Get canonical path of backup file
     let dest_canonical = pretty_path(fs::canonicalize(&destination)?);
 
-    fn copy_and_hash_data<Src, Dst, Hasher>(mut src: Src, mut dst: Dst, mut hasher: Hasher)
-        -> (usize, bool, Result<()>)
-        where
-            Src: Read + Seek, 
-            Dst: Write,
-            Hasher: Write {
-
+    fn copy_and_hash_data<Src, Dst, Hasher>(
+        mut src: Src,
+        mut dst: Dst,
+        mut hasher: Hasher,
+    ) -> (usize, bool, Result<()>)
+    where
+        Src: Read + Seek,
+        Dst: Write,
+        Hasher: Write,
+    {
         let mut fatal = false;
 
         let mut red = 0;
@@ -239,11 +241,10 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
                 fatal = true;
                 return hasher_res.context(
                     match write_res {
-                        Ok(_) => format!("Backup write error:"),
+                        Ok(_) => "Backup write error:".to_string(),
                         Err(write_err) => format!("Backup write error preceeded hasher error.\nBackup write error: {write_err:?}"),
                     }
                 );
-
             }
 
             write_res?;
@@ -262,14 +263,16 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
     // Start actually writing data
     // TODO: Progress bar
     let (hash, written, fatal, res) = if no_hash {
-        let (written, fatal, res) = copy_and_hash_data(&mut main_data, &mut backup_data, &mut NullBuffer);
+        let (written, fatal, res) =
+            copy_and_hash_data(&mut main_data, &mut backup_data, &mut NullBuffer);
         (None, written, fatal, res)
     } else {
         use base64::Engine;
         use sha3::digest::FixedOutput;
 
         let mut hasher = sha3::Sha3_256::default();
-        let (written, fatal, res) = copy_and_hash_data(&mut main_data, &mut backup_data, &mut hasher);
+        let (written, fatal, res) =
+            copy_and_hash_data(&mut main_data, &mut backup_data, &mut hasher);
         let hash = hasher.finalize_fixed();
         let hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
 
@@ -298,7 +301,9 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
     }
 
     // Make sure the data was actually written
-    backup_data.sync_data().context("Failed to sync written backup to underlieing storage.")?;
+    backup_data
+        .sync_data()
+        .context("Failed to sync written backup to underlieing storage.")?;
 
     // Figure out what was actually backed up
     let actually_backed_up = Slice {

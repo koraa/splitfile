@@ -1,8 +1,8 @@
 use std::fmt::Debug;
 use std::io::{Read, Result as IoResult, Write};
 
-use std::{fs::read_to_string, path::Path};
 use anyhow::Result;
+use std::{fs::read_to_string, path::Path};
 
 pub fn try_read_to_string<P: AsRef<Path>>(path: P) -> Result<Option<String>> {
     loop {
