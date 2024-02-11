@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::process::{exit, ExitCode};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use indicatif::ProgressBar;
 
 use crate::index::Index;
 use crate::util::{pretty_path, process_chunks, try_read_to_string, try_write_all, NullBuffer};
@@ -87,19 +87,35 @@ fn create(args: &CommandInvocation<CreateCommand>) -> Result<(ExitCode, Index)> 
 
     let mut file = fs::File::open(path)?;
 
+    let len = file.seek(SeekFrom::End(0)).ok();
+
     let (hash, len) = if no_hash {
-        let len = file.seek(SeekFrom::End(0))?;
-        (None, len)
+        if let Some(len) = len {
+            (None, len)
+        } else {
+            let progress = ProgressBar::new_spinner()
+                .with_message("Determining length of input file.");
+            std::io::copy(&mut file, &mut progress.wrap_write(&mut NullBuffer))?;
+            progress.finish();
+            (None, progress.position())
+        }
     } else {
         use base64::Engine;
         use sha3::digest::FixedOutput;
 
+        let progress = match len {
+            Some(len) => ProgressBar::new(len),
+            None => ProgressBar::new_spinner(),
+        }.with_message("Hashing source file");
+
         let mut hasher = sha3::Sha3_256::default();
-        std::io::copy(&mut file, &mut hasher)?;
+        std::io::copy(&mut file, &mut progress.wrap_write(&mut hasher))?;
         let hash = hasher.finalize_fixed();
         let hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
 
-        (Some(hash), file.stream_position()?)
+        progress.finish();
+
+        (Some(hash), progress.position())
     };
 
     let main_frag = Fragment {
@@ -215,7 +231,7 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
     fn copy_and_hash_data<Src, Dst, Hasher>(
         mut src: Src,
         mut dst: Dst,
-        mut hasher: Hasher,
+        mut hasher: Hasher
     ) -> (usize, bool, Result<()>)
     where
         Src: Read + Seek,
@@ -260,29 +276,35 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
         (written, fatal, res)
     }
 
-    // Start actually writing data
-    // TODO: Progress bar
-    let (hash, written, fatal, res) = if no_hash {
-        let (written, fatal, res) =
-            copy_and_hash_data(&mut main_data, &mut backup_data, &mut NullBuffer);
-        (None, written, fatal, res)
-    } else {
-        use base64::Engine;
-        use sha3::digest::FixedOutput;
+    let progress = ProgressBar::new(to_backup.end - to_backup.start)
+        .with_message("Copying data");
+    let (hash, written, fatal, res) = {
+        let mut backup_data = progress.wrap_write(&mut backup_data);
 
-        let mut hasher = sha3::Sha3_256::default();
-        let (written, fatal, res) =
-            copy_and_hash_data(&mut main_data, &mut backup_data, &mut hasher);
-        let hash = hasher.finalize_fixed();
-        let hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
+        // Start actually writing data
+        // TODO: Progress bar
+        if no_hash {
+            let (written, fatal, res) =
+                copy_and_hash_data(&mut main_data, &mut backup_data, &mut NullBuffer);
+            (None, written, fatal, res)
+        } else {
+            use base64::Engine;
+            use sha3::digest::FixedOutput;
 
-        (Some(hash), written, fatal, res)
+            let mut hasher = sha3::Sha3_256::default();
+            let (written, fatal, res) =
+                copy_and_hash_data(&mut main_data, &mut backup_data, &mut hasher);
+            let hash = hasher.finalize_fixed();
+            let hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
+
+            (Some(hash), written, fatal, res)
+        }
     };
 
     // Deal with the fatal bit
     if fatal {
         match res {
-            Ok(()) =>  bail!("Fatal error indication without an error value; This is likely a programming error."),
+            Ok(()) => bail!("Fatal error indication without an error value; This is likely a programming error."),
             Err(e) => return Err(e),
         }
     }
@@ -297,13 +319,25 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
 
     // Deal with the non-fatal error
     if let Err(e) = res {
-        log::warn!("Writing data to the backup terminated with non-fatal error: {e:?}");
+        progress.abandon_with_message(format!("Writing data to the backup terminated with non-fatal error: {e:?}"));
+    } else {
+        progress.finish();
     }
+
+    let progress = ProgressBar::new_spinner()
+        .with_message("Making sure all data was written…");
+    progress.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Make sure the data was actually written
     backup_data
         .sync_data()
-        .context("Failed to sync written backup to underlieing storage.")?;
+        .context("Failed to sync written backup to underlieing storage.")
+        .map_err(|e| {
+            progress.abandon();
+            e
+        })?;
+
+    progress.abandon();
 
     // Figure out what was actually backed up
     let actually_backed_up = Slice {
