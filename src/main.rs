@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 
 use std::fs;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write, Result as IoResult, Read};
 use std::process::{exit, ExitCode};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use sha3::digest::typenum::private::IsNotEqualPrivate;
 
 use crate::index::Index;
-use crate::util::{canonicalize_path_as_str, process_chunks, try_read_to_string};
+use crate::util::{process_chunks, try_read_to_string, pretty_path, try_write_all, NullBuffer};
 
 pub mod index;
 pub mod util;
@@ -83,7 +84,7 @@ fn create(args: &CommandInvocation<CreateCommand>) -> Result<(ExitCode, Index)> 
         no_hash,
     } = args.command;
 
-    let dbg_canonical = canonicalize_path_as_str(path);
+    let canonical = pretty_path(fs::canonicalize(path)?);
 
     let mut file = fs::File::open(path)?;
 
@@ -107,13 +108,13 @@ fn create(args: &CommandInvocation<CreateCommand>) -> Result<(ExitCode, Index)> 
             name: vec!["main".to_owned()],
             comment: vec![
                 format!("Relative path during fragment creation: {path}"),
-                format!("Canonical path during fragment creation: {dbg_canonical}"),
+                format!("Canonical path during fragment creation: {canonical}"),
             ],
         },
         groups: vec!["main".to_owned()],
         location: File {
             device: None,
-            path: path.to_owned(),
+            path: canonical.clone(),
         }
         .as_location(),
         hashes: {
@@ -132,7 +133,7 @@ fn create(args: &CommandInvocation<CreateCommand>) -> Result<(ExitCode, Index)> 
             name: name.iter().by_ref().map(|v| v.to_owned()).collect(),
             comment: vec![
                 format!("Relative path during creation: {path}"),
-                format!("Canonical path during creation: {dbg_canonical}"),
+                format!("Canonical path during creation: {canonical}"),
             ],
         },
         fragments: vec![main_frag],
@@ -183,7 +184,6 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
         backup_group,
         no_hash,
     } = args.command.clone();
-    let destination_canonical = canonicalize_path_as_str(&destination);
 
     // Open the main fragment
     let main_frag_no = idx.get_fragment_by_name("main")?;
@@ -210,31 +210,100 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
     // Open backup storage
     let mut backup_data = fs::File::create(&destination)?;
 
+    // Get canonical path of backup file
+    let dest_canonical = pretty_path(fs::canonicalize(&destination)?);
+
+    fn copy_and_hash_data<Src, Dst, Hasher>(mut src: Src, mut dst: Dst, mut hasher: Hasher)
+        -> (usize, bool, Result<()>)
+        where
+            Src: Read + Seek, 
+            Dst: Write,
+            Hasher: Write {
+
+        let mut fatal = false;
+
+        let mut red = 0;
+        let mut written = 0;
+        let mut hashed = 0;
+
+        let mut res = process_chunks(&mut src, &mut Vec::with_capacity(8192), |chunk| {
+            red += chunk.len();
+
+            let (chunk_written, write_res) = try_write_all(&mut dst, chunk);
+            written += chunk_written;
+
+            let (chunk_hashed, hasher_res) = try_write_all(&mut hasher, &chunk[..chunk_written]);
+            hashed += chunk_hashed;
+
+            if hasher_res.is_err() {
+                fatal = true;
+                return hasher_res.context(
+                    match write_res {
+                        Ok(_) => format!("Backup write error:"),
+                        Err(write_err) => format!("Backup write error preceeded hasher error.\nBackup write error: {write_err:?}"),
+                    }
+                );
+
+            }
+
+            write_res?;
+
+            Ok(())
+        });
+
+        if written != hashed {
+            fatal = true;
+            res = res.context(format!("Fatal condition: Stream offset missmatch between data hashed ({hashed} bytes) and data written to backup target ({written} bytes). Data red was {red} bytes."));
+        }
+
+        (written, fatal, res)
+    }
+
     // Start actually writing data
     // TODO: Progress bar
-    let hash = if no_hash {
-        std::io::copy(&mut main_data, &mut backup_data)?;
-        None
+    let (hash, written, fatal, res) = if no_hash {
+        let (written, fatal, res) = copy_and_hash_data(&mut main_data, &mut backup_data, &mut NullBuffer);
+        (None, written, fatal, res)
     } else {
         use base64::Engine;
         use sha3::digest::FixedOutput;
 
         let mut hasher = sha3::Sha3_256::default();
-        process_chunks(&mut main_data, &mut Vec::with_capacity(8192), |chunk| {
-            hasher.write_all(chunk)?;
-            backup_data.write_all(chunk)?;
-            Ok(())
-        })?;
+        let (written, fatal, res) = copy_and_hash_data(&mut main_data, &mut backup_data, &mut hasher);
         let hash = hasher.finalize_fixed();
         let hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
 
-        Some(hash)
+        (Some(hash), written, fatal, res)
     };
+
+    // Deal with the fatal bit
+    if fatal {
+        match res {
+            Ok(()) =>  bail!("Fatal error indication without an error value; This is likely a programming error."),
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Deal with the written length: Since there was *no* fatal error, it should be greater than zero
+    if written == 0 {
+        match res {
+            Ok(()) => bail!("No data written to backup destination for unknown reason; this is likely a programming error."),
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Deal with the non-fatal error
+    if let Err(e) = res {
+        eprintln!("Writing data to the backup terminated with non-fatal error: {e:?}");
+    }
+
+    // Make sure the data was actually written
+    backup_data.sync_data().context("Failed to sync written backup to underlieing storage.")?;
 
     // Figure out what was actually backed up
     let actually_backed_up = Slice {
         start: to_backup.start,
-        end: main_data.stream_position()?,
+        end: to_backup.start + (written as u64),
     };
 
     // Add the backup fragment
@@ -243,13 +312,13 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
             name: vec![],
             comment: vec![
                 format!("Relative path during fragment creation: {destination}"),
-                format!("Canonical path during fragment creation: {destination_canonical}"),
+                format!("Canonical path during fragment creation: {dest_canonical}"),
             ],
         },
         groups: vec![backup_group],
         location: File {
             device: None,
-            path: destination_canonical,
+            path: dest_canonical,
         }
         .as_location(),
         hashes: {
@@ -268,11 +337,11 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
     match to_backup {
         None => {
             eprintln!("Backup complete!");
-            Ok((ExitCode::from(3), idx))
+            Ok((ExitCode::from(0), idx))
         }
         Some(_) => {
             eprintln!("Wrote backup fragment. Specify further backup destinations to complete backing up the entire file.");
-            Ok((ExitCode::from(0), idx))
+            Ok((ExitCode::from(3), idx))
         }
     }
 }

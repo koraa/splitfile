@@ -269,6 +269,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "libc",
  "serde",
  "sha3",
  "toml",
