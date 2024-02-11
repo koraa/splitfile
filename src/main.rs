@@ -198,7 +198,7 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
     let to_backup = match to_backup {
         Some(v) => v,
         None => {
-            eprintln!("Backup already complete, no data was written!");
+            log::info!("Backup already complete, no data was written!");
             exit(3);
         }
     };
@@ -253,7 +253,7 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
 
         if written != hashed {
             fatal = true;
-            res = res.context(format!("Fatal condition: Stream offset missmatch between data hashed ({hashed} bytes) and data written to backup target ({written} bytes). Data red was {red} bytes."));
+            res = res.context(format!("Fatal condition: Stream offset missmatch between data hashed ({hashed} bytest ) and data written to backup target ({written} bytes). Data red was {red} bytes."));
         }
 
         (written, fatal, res)
@@ -294,7 +294,7 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
 
     // Deal with the non-fatal error
     if let Err(e) = res {
-        eprintln!("Writing data to the backup terminated with non-fatal error: {e:?}");
+        log::warn!("Writing data to the backup terminated with non-fatal error: {e:?}");
     }
 
     // Make sure the data was actually written
@@ -336,17 +336,22 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
     let to_backup = determine_next_backup(&idx, main_frag_geom, &args.command.backup_group);
     match to_backup {
         None => {
-            eprintln!("Backup complete!");
+            log::info!("Backup complete!");
             Ok((ExitCode::from(0), idx))
         }
         Some(_) => {
-            eprintln!("Wrote backup fragment. Specify further backup destinations to complete backing up the entire file.");
+            log::info!("Wrote backup fragment. Specify further backup destinations to complete backing up the entire file.");
             Ok((ExitCode::from(3), idx))
         }
     }
 }
 
 fn main() -> Result<ExitCode> {
+    pretty_env_logger::formatted_builder()
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .init();
+
     let cli = CliArgs::parse();
 
     // TODO: Use open and keep file locked
