@@ -1,11 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    fs,
-    io::{Seek, SeekFrom},
-};
+use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 
 pub type Offset = u64;
 
@@ -19,7 +15,7 @@ pub struct Meta {
     pub comment: Vec<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, Hash, PartialEq, Eq)]
+#[derive(Copy, Clone, Serialize, Deserialize, Debug, Hash, PartialEq, Eq)]
 pub enum HashIdentifier {
     Sha3_256,
 }
@@ -193,7 +189,7 @@ pub struct Location {
     pub slice: Option<Slice>,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize, Debug)]
+#[derive(Copy, Clone, Default, Serialize, Deserialize, Debug)]
 pub struct Slice {
     #[serde(default)]
     pub start: Offset,
@@ -207,6 +203,8 @@ pub struct Fragment {
     pub meta: Meta,
     #[serde(flatten)]
     pub location: Location,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub hashes: HashMap<HashIdentifier, String>,
@@ -224,4 +222,24 @@ pub struct Index {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fragments: Vec<Fragment>,
+}
+
+impl Index {
+    pub fn get_fragment_by_name(&self, name: &str) -> Result<usize> {
+        self.fragments
+            .iter()
+            .enumerate()
+            .fold(Ok(None), |state, (idx, frag)| -> Result<Option<usize>> {
+                let matches = frag.meta.name.iter().any(|n| {
+                    let n: &str = n;
+                    n == "main"
+                });
+                match (matches, &state) {
+                    (false, _) | (_, Err(_)) => state, // nop
+                    (true, Ok(Some(_))) => bail!("Found two fragments named `{}` in index.", name),
+                    (true, Ok(None)) => Ok(Some(idx)),
+                }
+            })?
+            .with_context(|| format!("No such fragment `{name}`."))
+    }
 }
