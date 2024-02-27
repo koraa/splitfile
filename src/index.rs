@@ -221,7 +221,7 @@ pub struct Fragment {
     pub holes: Vec<Slice>,
 }
 
-struct FragmentPtr {
+pub struct FragmentPtr {
     no: usize
 }
 
@@ -295,11 +295,11 @@ impl FragmentPtr {
         self.no
     }
 
-    pub fn get(&self, index: &Index) -> &Fragment {
+    pub fn get<'a>(&self, index: &'a Index) -> &'a Fragment {
         &index.fragments[self.no]
     }
 
-    pub fn get_mut(&self, index: &mut Index) -> &mut Fragment {
+    pub fn get_mut<'a>(&self, index: &'a mut Index) -> &'a mut Fragment {
         &mut index.fragments[self.no]
     }
 }
