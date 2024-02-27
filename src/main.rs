@@ -41,7 +41,7 @@ struct WriteBackupCommand {
 
 #[derive(Clone, Args, Debug)]
 struct RestoreFromFragment {
-    #[arg(short = 's', long = "source-frag", default_value = "main")]
+    #[arg(short = 's', long = "source-frag")]
     pub source_fragment: String,
 
     #[arg(short = 'd', long = "dest-frag")]
@@ -51,11 +51,18 @@ struct RestoreFromFragment {
     pub no_hash: bool,
 }
 
+#[derive(Clone, Args, Debug)]
+struct ValidateHash {
+    #[arg(short = 'f', long = "fragment")]
+    pub fragment: String,
+}
+
 #[derive(Clone, Subcommand, Debug)]
 enum Command {
     Create(CreateCommand),
     WriteBackup(WriteBackupCommand),
     RestoreFromFragment(RestoreFromFragment),
+    ValidateHash(ValidateHash),
 }
 
 #[derive(Clone, Parser, Debug)]
@@ -407,6 +414,38 @@ fn restore_from_fragment(args: &CommandInvocation<RestoreFromFragment>) -> Resul
     Ok(ExitCode::from(0))
 }
 
+fn validate_hash(args: &CommandInvocation<ValidateHash>) -> Result<ExitCode> {
+    use index::*;
+
+    let ValidateHash { fragment: ref frag } = args.command;
+
+    let idx = args.use_index()?;
+    let frag = idx.get_fragment_by_name(frag)?;
+
+    let ref_hash = frag.get(&idx).hashes.get(&HashIdentifier::Sha3_256);
+    if ref_hash.is_none() {
+        log::warn!("Source fragment is missing its reference hash. Will calculate the hash…");
+    }
+
+    let mut fragio = fs::File::open(frag.get(&idx).filepath())?;
+
+    let progress = ProgressBar::new(frag.get(&idx).geometry.len())
+        .with_message("Calculating hash");
+    let hash = hash_data(progress.wrap_read(&mut fragio))?;
+    progress.finish();
+
+    match ref_hash {
+        Some(ref_hash) => {
+            ensure!(*hash == *ref_hash, "Mismatch between hash and reference: ref={ref_hash:?}, hash={hash:?}");
+            Ok(ExitCode::from(0))
+        },
+        None => {
+            log::warn!("Calculated hash: {hash:?}. Cannot validate since reference hash is missing from fragment.");
+            Ok(ExitCode::from(3))
+        }
+    }
+}
+
 fn main() -> Result<ExitCode> {
     pretty_env_logger::formatted_builder()
         .filter_level(log::LevelFilter::Info)
@@ -437,6 +476,15 @@ fn main() -> Result<ExitCode> {
             C::RestoreFromFragment(command) => {
                 // TODO: Dirty!
                 let status = restore_from_fragment(&CommandInvocation {
+                    index_file,
+                    index,
+                    command,
+                })?;
+                return Ok(status);
+            },
+            C::ValidateHash(command) => {
+                // TODO: Dirty!
+                let status = validate_hash(&CommandInvocation {
                     index_file,
                     index,
                     command,
