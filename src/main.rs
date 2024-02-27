@@ -8,10 +8,12 @@ use clap::{Args, Parser, Subcommand};
 use indicatif::ProgressBar;
 
 use crate::index::Index;
-use crate::util::{pretty_path, process_chunks, try_read_to_string, try_write_all, NullBuffer};
+use crate::util::{pretty_path, process_chunks, try_read_to_string, try_write_all, NullBuffer, uuidgen};
+use crate::copy::{copy_and_optionally_hash, hash_data};
 
 pub mod index;
-pub mod util;
+pub(crate) mod util;
+pub(crate) mod copy;
 
 #[derive(Clone, Args, Debug)]
 struct CreateCommand {
@@ -37,10 +39,23 @@ struct WriteBackupCommand {
     pub no_hash: bool,
 }
 
+#[derive(Clone, Args, Debug)]
+struct RestoreFromFragment {
+    #[arg(short = 's', long = "source-frag", default_value = "main")]
+    pub source_fragment: String,
+
+    #[arg(short = 'd', long = "dest-frag")]
+    pub dest_fragment: Option<String>,
+
+    #[arg(long)]
+    pub no_hash: bool,
+}
+
 #[derive(Clone, Subcommand, Debug)]
 enum Command {
     Create(CreateCommand),
     WriteBackup(WriteBackupCommand),
+    RestoreFromFragment(RestoreFromFragment),
 }
 
 #[derive(Clone, Parser, Debug)]
@@ -82,45 +97,54 @@ fn create(args: &CommandInvocation<CreateCommand>) -> Result<(ExitCode, Index)> 
         ref path,
         no_hash,
     } = args.command;
+    let with_hash = !no_hash;
 
     let canonical = pretty_path(fs::canonicalize(path)?);
 
-    let mut file = fs::File::open(path)?;
+    let (hash, len) = {
+        let mut file = fs::File::open(path)?;
+        let len = file.seek(SeekFrom::End(0)).ok();
 
-    let len = file.seek(SeekFrom::End(0)).ok();
+        match (with_hash, len) {
+            // Determined len through seek and no hashing; this is quick
+            (false, Some(len)) => (None, len),
 
-    let (hash, len) = if no_hash {
-        if let Some(len) = len {
-            (None, len)
-        } else {
-            let progress = ProgressBar::new_spinner()
-                .with_message("Determining length of input file.");
-            std::io::copy(&mut file, &mut progress.wrap_write(&mut NullBuffer))?;
-            progress.finish();
-            (None, progress.position())
+            // Could not determine len through seek, we will have to consume the stream to
+            // determine the length. Hashing disabled.
+            (false, None) => {
+                let progress = ProgressBar::new_spinner()
+                    .with_message("Determining length of input file.");
+                std::io::copy(&mut file, &mut progress.wrap_write(&mut NullBuffer))?;
+                progress.finish();
+                (None, progress.position())
+
+            },
+
+            // Hashing enabled. We will have to consume the stream in any case.
+            (true, Some(len)) => {
+                let progress = ProgressBar::new(len).with_message("Hashing source file");
+                let hash = hash_data(&mut progress.wrap_read(&mut file))?;
+                progress.finish();
+                let pos = progress.position();
+                ensure!(pos == len,"Mismatch between position determined through seek ({len}) \
+                    and the position determined by consuming the stream ({pos}).");
+                (Some(hash), len)
+            },
+
+            // Hashing enabled, no length estimate. Consuming the stream manually to determine
+            // length
+            (true, None) => {
+                let progress = ProgressBar::new_spinner().with_message("Hashing source file");
+                let hash = hash_data(&mut progress.wrap_read(&mut file))?;
+                progress.finish();
+                (Some(hash), progress.position())
+            }
         }
-    } else {
-        use base64::Engine;
-        use sha3::digest::FixedOutput;
-
-        let progress = match len {
-            Some(len) => ProgressBar::new(len),
-            None => ProgressBar::new_spinner(),
-        }.with_message("Hashing source file");
-
-        let mut hasher = sha3::Sha3_256::default();
-        std::io::copy(&mut file, &mut progress.wrap_write(&mut hasher))?;
-        let hash = hasher.finalize_fixed();
-        let hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
-
-        progress.finish();
-
-        (Some(hash), progress.position())
     };
 
     let main_frag = Fragment {
         meta: Meta {
-            name: vec!["main".to_owned()],
+            name: vec!["main".to_owned(), uuidgen()],
             comment: vec![
                 format!("Relative path during fragment creation: {path}"),
                 format!("Canonical path during fragment creation: {canonical}"),
@@ -160,19 +184,14 @@ fn create(args: &CommandInvocation<CreateCommand>) -> Result<(ExitCode, Index)> 
 fn get_fragment_group(idx: &Index, group: &str) -> Vec<index::Slice> {
     idx.fragments
         .iter()
-        .filter(|frag| {
-            frag.groups.iter().any(|g| {
-                let g: &str = g;
-                g == group
-            })
-        })
+        .filter(|frag| frag.in_group(group))
         .map(|frag| frag.geometry)
         .collect::<Vec<_>>()
 }
 
 fn determine_next_backup(
     idx: &Index,
-    mut to_backup: index::Slice,
+   mut to_backup: index::Slice,
     group: &str,
 ) -> Option<index::Slice> {
     let mut backed_up = get_fragment_group(idx, group);
@@ -199,11 +218,12 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
         backup_group,
         no_hash,
     } = args.command.clone();
+    let with_hash = !no_hash;
 
     // Open the main fragment
-    let main_frag_no = idx.get_fragment_by_name("main")?;
-    let main_frag_geom = idx.fragments[main_frag_no].geometry;
-    let main_path = match &idx.fragments[main_frag_no].location.data {
+    let main_frag = idx.get_fragment_by_name("main")?;
+    let main_frag_geom = main_frag.get(&idx).geometry;
+    let main_path = match &main_frag.get(&idx).location.data {
         LocationData::File(File { path, .. }) => path,
         data => bail!("Reading from location data of this type is not implemented: {data:?}"),
     };
@@ -228,78 +248,11 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
     // Get canonical path of backup file
     let dest_canonical = pretty_path(fs::canonicalize(&destination)?);
 
-    fn copy_and_hash_data<Src, Dst, Hasher>(
-        mut src: Src,
-        mut dst: Dst,
-        mut hasher: Hasher
-    ) -> (usize, bool, Result<()>)
-    where
-        Src: Read + Seek,
-        Dst: Write,
-        Hasher: Write,
-    {
-        let mut fatal = false;
-
-        let mut red = 0;
-        let mut written = 0;
-        let mut hashed = 0;
-
-        let mut res = process_chunks(&mut src, &mut Vec::with_capacity(8192), |chunk| {
-            red += chunk.len();
-
-            let (chunk_written, write_res) = try_write_all(&mut dst, chunk);
-            written += chunk_written;
-
-            let (chunk_hashed, hasher_res) = try_write_all(&mut hasher, &chunk[..chunk_written]);
-            hashed += chunk_hashed;
-
-            if hasher_res.is_err() {
-                fatal = true;
-                return hasher_res.context(
-                    match write_res {
-                        Ok(_) => "Backup write error:".to_string(),
-                        Err(write_err) => format!("Backup write error preceeded hasher error.\nBackup write error: {write_err:?}"),
-                    }
-                );
-            }
-
-            write_res?;
-
-            Ok(())
-        });
-
-        if written != hashed {
-            fatal = true;
-            res = res.context(format!("Fatal condition: Stream offset missmatch between data hashed ({hashed} bytest ) and data written to backup target ({written} bytes). Data red was {red} bytes."));
-        }
-
-        (written, fatal, res)
-    }
-
     let progress = ProgressBar::new(to_backup.end - to_backup.start)
         .with_message("Copying data");
-    let (hash, written, fatal, res) = {
-        let mut backup_data = progress.wrap_write(&mut backup_data);
-
-        // Start actually writing data
-        // TODO: Progress bar
-        if no_hash {
-            let (written, fatal, res) =
-                copy_and_hash_data(&mut main_data, &mut backup_data, &mut NullBuffer);
-            (None, written, fatal, res)
-        } else {
-            use base64::Engine;
-            use sha3::digest::FixedOutput;
-
-            let mut hasher = sha3::Sha3_256::default();
-            let (written, fatal, res) =
-                copy_and_hash_data(&mut main_data, &mut backup_data, &mut hasher);
-            let hash = hasher.finalize_fixed();
-            let hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
-
-            (Some(hash), written, fatal, res)
-        }
-    };
+    let (hash, written, fatal, res) =
+        copy_and_optionally_hash(with_hash, &mut main_data,
+            progress.wrap_write(&mut backup_data));
 
     // Deal with the fatal bit
     if fatal {
@@ -348,7 +301,7 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
     // Add the backup fragment
     idx.fragments.push(Fragment {
         meta: Meta {
-            name: vec![],
+            name: vec![uuidgen()],
             comment: vec![
                 format!("Relative path during fragment creation: {destination}"),
                 format!("Canonical path during fragment creation: {dest_canonical}"),
@@ -385,6 +338,75 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
     }
 }
 
+fn restore_from_fragment(args: &CommandInvocation<RestoreFromFragment>) -> Result<ExitCode> {
+    use index::*;
+
+    let RestoreFromFragment {
+      source_fragment: ref src,
+      dest_fragment: ref dst,
+      no_hash
+    } = args.command;
+    let with_hash = !no_hash;
+
+    let idx = args.use_index()?;
+
+    let src = idx.get_fragment_by_name(src)?;
+    let dst = idx.get_fragment_by_name(dst.as_deref().unwrap_or("main"))?;
+
+    let ref_hash = with_hash.then(|| {
+        src.get(&idx).hashes.get(&HashIdentifier::Sha3_256)
+            .context("Source fragment does not contain a hash value. \
+                Try the --no-hash option if you did not intend to check the validity of your hashes.")
+    }).transpose()?;
+
+    let copy_geom = {
+        use std::cmp::{min, max};
+        let (sa, sz) = src.get(&idx).geometry.into();
+        let (da, dz) = src.get(&idx).geometry.into();
+        Slice { start: max(sa, da), end: min(sz, dz) }
+    };
+
+    if copy_geom.end > copy_geom.start {
+        log::info!("Fragment regions do not overlap. No data copied!");
+        return Ok(ExitCode::from(0));
+    }
+
+    let mut srcio = fs::File::open(src.get(&idx).filepath())?;
+    srcio.seek(SeekFrom::Start(copy_geom.start - src.get(&idx).geometry.start))?;
+
+    let mut dstio = fs::File::open(dst.get(&idx).filepath())?;
+    dstio.seek(SeekFrom::Start(copy_geom.start - src.get(&idx).geometry.end))?;
+
+    let progress = ProgressBar::new(copy_geom.len())
+        .with_message("Copying data");
+
+    let (hash, written, fatal, res) =
+        copy_and_optionally_hash(with_hash, srcio,
+            progress.wrap_write(&mut dstio));
+
+    if fatal {
+        match res {
+            Ok(()) => bail!("Fatal error indication without an error value; This is likely a programming error."),
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Deal with the non-fatal error
+    if let Err(e) = res {
+        progress.abandon_with_message(format!("Writing data to the backup terminated with non-fatal error: {e:?}"));
+    } else {
+        progress.finish();
+    }
+
+    ensure!(written == copy_geom.len() as usize, "Failed to copy all data, \
+        only copied {written} bytes for some reason.\
+        \n\tDebug data: hash=`{hash:?}`");
+
+    ensure!(hash.as_ref() == ref_hash, "Mismatch between hash and reference: ref={ref_hash:?}, hash={hash:?}");
+
+    Ok(ExitCode::from(0))
+}
+
 fn main() -> Result<ExitCode> {
     pretty_env_logger::formatted_builder()
         .filter_level(log::LevelFilter::Info)
@@ -412,6 +434,15 @@ fn main() -> Result<ExitCode> {
                 index,
                 command,
             })?,
+            C::RestoreFromFragment(command) => {
+                // TODO: Dirty!
+                let status = restore_from_fragment(&CommandInvocation {
+                    index_file,
+                    index,
+                    command,
+                })?;
+                return Ok(status);
+            }
         }
     };
 

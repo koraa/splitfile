@@ -77,3 +77,7 @@ impl Write for NullBuffer {
         Ok(())
     }
 }
+
+pub fn uuidgen() -> String {
+    uuid::Uuid::new_v4().to_string()
+}

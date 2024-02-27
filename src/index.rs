@@ -197,6 +197,12 @@ pub struct Slice {
     pub end: Offset,
 }
 
+impl Into<(Offset, Offset)> for Slice {
+    fn into(self) -> (Offset, Offset) {
+        (self.start, self.end)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Fragment {
     #[serde(flatten)]
@@ -215,6 +221,10 @@ pub struct Fragment {
     pub holes: Vec<Slice>,
 }
 
+struct FragmentPtr {
+    no: usize
+}
+
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
 pub struct Index {
     #[serde(flatten)]
@@ -224,22 +234,72 @@ pub struct Index {
     pub fragments: Vec<Fragment>,
 }
 
+impl Slice {
+    pub fn len(&self) -> u64 {
+        self.end - self.start 
+    }
+}
+
 impl Index {
-    pub fn get_fragment_by_name(&self, name: &str) -> Result<usize> {
+    pub fn get_fragment_by_name(&self, name: &str) -> Result<FragmentPtr> {
         self.fragments
             .iter()
             .enumerate()
             .fold(Ok(None), |state, (idx, frag)| -> Result<Option<usize>> {
-                let matches = frag.meta.name.iter().any(|n| {
-                    let n: &str = n;
-                    n == "main"
-                });
-                match (matches, &state) {
-                    (false, _) | (_, Err(_)) => state, // nop
+                match (frag.is_named(name), &state) {
+                    (false, _) | (_, Err(_)) => state, // nop: regular search | error propagation
                     (true, Ok(Some(_))) => bail!("Found two fragments named `{}` in index.", name),
-                    (true, Ok(None)) => Ok(Some(idx)),
+                    (true, Ok(None)) => Ok(Some(idx)), // found!
                 }
             })?
             .with_context(|| format!("No such fragment `{name}`."))
+            .map(FragmentPtr::new)
+    }
+}
+
+impl Meta {
+    pub fn is_named(&self, name: &str) -> bool {
+        self.name.iter().any(|n| *n == name)
+    }
+}
+
+impl Fragment {
+    pub fn filepath(&self) -> &String {
+        match &self.location {
+            Location {
+                slice: None,
+                data: LocationData::File(File {
+                    device: None,
+                    path
+                })
+            } => &path,
+            _ => todo!("Not implemented: file_location() for Fragment format: {self:?}"),
+        }
+    }
+
+    pub fn in_group(&self, group: &str) -> bool {
+        self.groups.iter().any(|g| *g == group)
+    }
+
+    pub fn is_named(&self, name: &str) -> bool {
+        self.meta.is_named(name)
+    }
+}
+
+impl FragmentPtr {
+    pub fn new(no: usize) -> Self {
+        Self { no }
+    }
+
+    pub fn idx(&self) -> usize {
+        self.no
+    }
+
+    pub fn get(&self, index: &Index) -> &Fragment {
+        &index.fragments[self.no]
+    }
+
+    pub fn get_mut(&self, index: &mut Index) -> &mut Fragment {
+        &mut index.fragments[self.no]
     }
 }
