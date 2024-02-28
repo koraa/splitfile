@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt::{Debug, Display};
-use std::io::{Read, Result as IoResult, Write, Seek};
+use std::io::{Read, Result as IoResult, Seek, Write};
 
 use anyhow::Result;
 use std::{fs::read_to_string, path::Path};
@@ -108,16 +108,21 @@ impl<R: Read + Seek> TruncateReadStream<R> {
     pub fn new(mut inner: R, limit: usize) -> Result<Self> {
         let pos = inner.stream_position()? as usize;
         let limit = limit + pos;
-        Ok(Self { inner, limit, pos, extended: false } )
+        Ok(Self {
+            inner,
+            limit,
+            pos,
+            extended: false,
+        })
     }
 }
 
 impl<R: Read + Seek> Read for TruncateReadStream<R> {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
         use std::cmp::min;
-        
+
         if self.pos == self.limit {
-            return Ok(0)
+            return Ok(0);
         }
 
         if self.extended {
@@ -125,14 +130,14 @@ impl<R: Read + Seek> Read for TruncateReadStream<R> {
             self.extended = false;
         }
 
-        let local_limit = min(buf.len(), (self.limit - self.pos) as usize);
+        let local_limit = min(buf.len(), self.limit - self.pos);
         let buf = &mut buf[..local_limit];
         let r = match self.inner.read(buf)? {
-            0 => { 
+            0 => {
                 buf.fill(0);
                 self.extended = true;
                 buf.len()
-            },
+            }
             v => v,
         };
 
@@ -153,9 +158,15 @@ impl<R: Read + Seek> Seek for TruncateReadStream<R> {
         };
 
         if new < 0 {
-            return Err(std::io::Error::new(ErrorKind::InvalidInput, TruncateReadStreamError::NegativeSeek));
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                TruncateReadStreamError::NegativeSeek,
+            ));
         } else if new as usize > self.limit {
-            return Err(std::io::Error::new(ErrorKind::InvalidInput, TruncateReadStreamError::SeekPastEnd));
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                TruncateReadStreamError::SeekPastEnd,
+            ));
         }
 
         self.inner.seek(S::Start(new as u64))

@@ -398,7 +398,8 @@ fn restore_from_fragment(args: &CommandInvocation<RestoreFromFragment>) -> Resul
         }
     }).transpose()?;
 
-    log::debug!("Source geometry: {:?}\n\
+    log::debug!(
+        "Source geometry: {:?}\n\
         Dest geometry: {:?}\n\
         Copy geometry: {:?}\n\
         Src File off: {}\n\
@@ -407,7 +408,8 @@ fn restore_from_fragment(args: &CommandInvocation<RestoreFromFragment>) -> Resul
         dst.get(&idx).geometry,
         copy_geo,
         copy_geo.start - src.get(&idx).geometry.start,
-        copy_geo.start - dst.get(&idx).geometry.start);
+        copy_geo.start - dst.get(&idx).geometry.start
+    );
 
     if copy_geo.end <= copy_geo.start {
         log::info!("Fragment regions do not overlap. No data copied!");
