@@ -197,9 +197,9 @@ pub struct Slice {
     pub end: Offset,
 }
 
-impl Into<(Offset, Offset)> for Slice {
-    fn into(self) -> (Offset, Offset) {
-        (self.start, self.end)
+impl From<Slice> for (Offset, Offset) {
+    fn from(val: Slice) -> Self {
+        (val.start, val.end)
     }
 }
 
@@ -222,7 +222,7 @@ pub struct Fragment {
 }
 
 pub struct FragmentPtr {
-    no: usize
+    no: usize,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
@@ -236,7 +236,11 @@ pub struct Index {
 
 impl Slice {
     pub fn len(&self) -> u64 {
-        self.end - self.start 
+        self.end - self.start
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -268,11 +272,8 @@ impl Fragment {
         match &self.location {
             Location {
                 slice: None,
-                data: LocationData::File(File {
-                    device: None,
-                    path
-                })
-            } => &path,
+                data: LocationData::File(File { device: None, path }),
+            } => path,
             _ => todo!("Not implemented: file_location() for Fragment format: {self:?}"),
         }
     }

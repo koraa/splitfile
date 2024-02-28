@@ -1,19 +1,19 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom};
 use std::process::{exit, ExitCode};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use indicatif::ProgressBar;
 
-use crate::index::Index;
-use crate::util::{pretty_path, process_chunks, try_read_to_string, try_write_all, NullBuffer, uuidgen};
 use crate::copy::{copy_and_optionally_hash, hash_data};
+use crate::index::Index;
+use crate::util::{pretty_path, try_read_to_string, uuidgen, NullBuffer};
 
+pub(crate) mod copy;
 pub mod index;
 pub(crate) mod util;
-pub(crate) mod copy;
 
 #[derive(Clone, Args, Debug)]
 struct CreateCommand {
@@ -119,13 +119,12 @@ fn create(args: &CommandInvocation<CreateCommand>) -> Result<(ExitCode, Index)> 
             // Could not determine len through seek, we will have to consume the stream to
             // determine the length. Hashing disabled.
             (false, None) => {
-                let progress = ProgressBar::new_spinner()
-                    .with_message("Determining length of input file.");
+                let progress =
+                    ProgressBar::new_spinner().with_message("Determining length of input file.");
                 std::io::copy(&mut file, &mut progress.wrap_write(&mut NullBuffer))?;
                 progress.finish();
                 (None, progress.position())
-
-            },
+            }
 
             // Hashing enabled. We will have to consume the stream in any case.
             (true, Some(len)) => {
@@ -133,10 +132,13 @@ fn create(args: &CommandInvocation<CreateCommand>) -> Result<(ExitCode, Index)> 
                 let hash = hash_data(&mut progress.wrap_read(&mut file))?;
                 progress.finish();
                 let pos = progress.position();
-                ensure!(pos == len,"Mismatch between position determined through seek ({len}) \
-                    and the position determined by consuming the stream ({pos}).");
+                ensure!(
+                    pos == len,
+                    "Mismatch between position determined through seek ({len}) \
+                    and the position determined by consuming the stream ({pos})."
+                );
                 (Some(hash), len)
-            },
+            }
 
             // Hashing enabled, no length estimate. Consuming the stream manually to determine
             // length
@@ -198,7 +200,7 @@ fn get_fragment_group(idx: &Index, group: &str) -> Vec<index::Slice> {
 
 fn determine_next_backup(
     idx: &Index,
-   mut to_backup: index::Slice,
+    mut to_backup: index::Slice,
     group: &str,
 ) -> Option<index::Slice> {
     let mut backed_up = get_fragment_group(idx, group);
@@ -255,11 +257,12 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
     // Get canonical path of backup file
     let dest_canonical = pretty_path(fs::canonicalize(&destination)?);
 
-    let progress = ProgressBar::new(to_backup.end - to_backup.start)
-        .with_message("Copying data");
-    let (hash, written, fatal, res) =
-        copy_and_optionally_hash(with_hash, &mut main_data,
-            progress.wrap_write(&mut backup_data));
+    let progress = ProgressBar::new(to_backup.end - to_backup.start).with_message("Copying data");
+    let (hash, written, fatal, res) = copy_and_optionally_hash(
+        with_hash,
+        &mut main_data,
+        progress.wrap_write(&mut backup_data),
+    );
 
     // Deal with the fatal bit
     if fatal {
@@ -279,13 +282,14 @@ fn write_backup(args: &CommandInvocation<WriteBackupCommand>) -> Result<(ExitCod
 
     // Deal with the non-fatal error
     if let Err(e) = res {
-        progress.abandon_with_message(format!("Writing data to the backup terminated with non-fatal error: {e:?}"));
+        progress.abandon_with_message(format!(
+            "Writing data to the backup terminated with non-fatal error: {e:?}"
+        ));
     } else {
         progress.finish();
     }
 
-    let progress = ProgressBar::new_spinner()
-        .with_message("Making sure all data was written…");
+    let progress = ProgressBar::new_spinner().with_message("Making sure all data was written…");
     progress.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Make sure the data was actually written
@@ -349,9 +353,9 @@ fn restore_from_fragment(args: &CommandInvocation<RestoreFromFragment>) -> Resul
     use index::*;
 
     let RestoreFromFragment {
-      source_fragment: ref src,
-      dest_fragment: ref dst,
-      no_hash
+        source_fragment: ref src,
+        dest_fragment: ref dst,
+        no_hash,
     } = args.command;
     let with_hash = !no_hash;
 
@@ -367,10 +371,13 @@ fn restore_from_fragment(args: &CommandInvocation<RestoreFromFragment>) -> Resul
     }).transpose()?;
 
     let copy_geom = {
-        use std::cmp::{min, max};
+        use std::cmp::{max, min};
         let (sa, sz) = src.get(&idx).geometry.into();
         let (da, dz) = src.get(&idx).geometry.into();
-        Slice { start: max(sa, da), end: min(sz, dz) }
+        Slice {
+            start: max(sa, da),
+            end: min(sz, dz),
+        }
     };
 
     if copy_geom.end > copy_geom.start {
@@ -379,17 +386,19 @@ fn restore_from_fragment(args: &CommandInvocation<RestoreFromFragment>) -> Resul
     }
 
     let mut srcio = fs::File::open(src.get(&idx).filepath())?;
-    srcio.seek(SeekFrom::Start(copy_geom.start - src.get(&idx).geometry.start))?;
+    srcio.seek(SeekFrom::Start(
+        copy_geom.start - src.get(&idx).geometry.start,
+    ))?;
 
     let mut dstio = fs::File::open(dst.get(&idx).filepath())?;
-    dstio.seek(SeekFrom::Start(copy_geom.start - src.get(&idx).geometry.end))?;
+    dstio.seek(SeekFrom::Start(
+        copy_geom.start - src.get(&idx).geometry.end,
+    ))?;
 
-    let progress = ProgressBar::new(copy_geom.len())
-        .with_message("Copying data");
+    let progress = ProgressBar::new(copy_geom.len()).with_message("Copying data");
 
     let (hash, written, fatal, res) =
-        copy_and_optionally_hash(with_hash, srcio,
-            progress.wrap_write(&mut dstio));
+        copy_and_optionally_hash(with_hash, srcio, progress.wrap_write(&mut dstio));
 
     if fatal {
         match res {
@@ -400,16 +409,24 @@ fn restore_from_fragment(args: &CommandInvocation<RestoreFromFragment>) -> Resul
 
     // Deal with the non-fatal error
     if let Err(e) = res {
-        progress.abandon_with_message(format!("Writing data to the backup terminated with non-fatal error: {e:?}"));
+        progress.abandon_with_message(format!(
+            "Writing data to the backup terminated with non-fatal error: {e:?}"
+        ));
     } else {
         progress.finish();
     }
 
-    ensure!(written == copy_geom.len() as usize, "Failed to copy all data, \
+    ensure!(
+        written == copy_geom.len() as usize,
+        "Failed to copy all data, \
         only copied {written} bytes for some reason.\
-        \n\tDebug data: hash=`{hash:?}`");
+        \n\tDebug data: hash=`{hash:?}`"
+    );
 
-    ensure!(hash.as_ref() == ref_hash, "Mismatch between hash and reference: ref={ref_hash:?}, hash={hash:?}");
+    ensure!(
+        hash.as_ref() == ref_hash,
+        "Mismatch between hash and reference: ref={ref_hash:?}, hash={hash:?}"
+    );
 
     Ok(ExitCode::from(0))
 }
@@ -429,16 +446,18 @@ fn validate_hash(args: &CommandInvocation<ValidateHash>) -> Result<ExitCode> {
 
     let mut fragio = fs::File::open(frag.get(&idx).filepath())?;
 
-    let progress = ProgressBar::new(frag.get(&idx).geometry.len())
-        .with_message("Calculating hash");
+    let progress = ProgressBar::new(frag.get(&idx).geometry.len()).with_message("Calculating hash");
     let hash = hash_data(progress.wrap_read(&mut fragio))?;
     progress.finish();
 
     match ref_hash {
         Some(ref_hash) => {
-            ensure!(*hash == *ref_hash, "Mismatch between hash and reference: ref={ref_hash:?}, hash={hash:?}");
+            ensure!(
+                *hash == *ref_hash,
+                "Mismatch between hash and reference: ref={ref_hash:?}, hash={hash:?}"
+            );
             Ok(ExitCode::from(0))
-        },
+        }
         None => {
             log::warn!("Calculated hash: {hash:?}. Cannot validate since reference hash is missing from fragment.");
             Ok(ExitCode::from(3))
@@ -481,7 +500,7 @@ fn main() -> Result<ExitCode> {
                     command,
                 })?;
                 return Ok(status);
-            },
+            }
             C::ValidateHash(command) => {
                 // TODO: Dirty!
                 let status = validate_hash(&CommandInvocation {

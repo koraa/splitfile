@@ -1,6 +1,6 @@
 use std::io::{Read, Seek, Write};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 use crate::util::{process_chunks, try_write_all, NullBuffer};
 
@@ -11,7 +11,7 @@ use crate::util::{process_chunks, try_write_all, NullBuffer};
 pub fn copy_and_hash_with<Src, Dst, Hasher>(
     mut src: Src,
     mut dst: Dst,
-    mut hasher: Hasher
+    mut hasher: Hasher,
 ) -> (usize, bool, Result<()>)
 where
     Src: Read + Seek,
@@ -35,12 +35,12 @@ where
 
         if hasher_res.is_err() {
             fatal = true;
-            return hasher_res.context(
-                match write_res {
-                    Ok(_) => "Backup write error:".to_string(),
-                    Err(write_err) => format!("Backup write error preceeded hasher error.\nBackup write error: {write_err:?}"),
-                }
-            );
+            return hasher_res.context(match write_res {
+                Ok(_) => "Backup write error:".to_string(),
+                Err(write_err) => format!(
+                    "Backup write error preceeded hasher error.\nBackup write error: {write_err:?}"
+                ),
+            });
         }
 
         write_res?;
@@ -56,10 +56,7 @@ where
     (written, fatal, res)
 }
 
-pub fn copy_and_hash<Src, Dst>(
-    mut src: Src,
-    mut dst: Dst,
-) -> (String, usize, bool, Result<()>)
+pub fn copy_and_hash<Src, Dst>(src: Src, dst: Dst) -> (String, usize, bool, Result<()>)
 where
     Src: Read + Seek,
     Dst: Write,
@@ -76,10 +73,7 @@ where
     (hash, written, fatal, res)
 }
 
-pub fn copy_without_hash<Src, Dst>(
-    mut src: Src,
-    mut dst: Dst,
-) -> (usize, bool, Result<()>)
+pub fn copy_without_hash<Src, Dst>(src: Src, dst: Dst) -> (usize, bool, Result<()>)
 where
     Src: Read + Seek,
     Dst: Write,
@@ -88,32 +82,35 @@ where
     (written, fatal, res)
 }
 
-
-pub fn hash_data<Src: Read + Seek>(mut src: Src) -> Result<String> {
+pub fn hash_data<Src: Read + Seek>(src: Src) -> Result<String> {
     match copy_and_hash(src, &mut NullBuffer) {
         // Expected results
-        (hash, _, false, Ok(()))        => Ok(hash), // Regular result
-        (_hash, _written, true, Err(e)) => Err(e),   // Fatal error
+        (hash, _, false, Ok(())) => Ok(hash), // Regular result
+        (_hash, _written, true, Err(e)) => Err(e), // Fatal error
 
         // Weird results
         (hash, written, true, Ok(())) => {
-            bail!("Fatal error indicated but no error message. \
+            bail!(
+                "Fatal error indicated but no error message. \
                 This is a developer error.\
-                \n\tDebug info: written=`{written}`, hash=`{hash}`.");
-        },
+                \n\tDebug info: written=`{written}`, hash=`{hash}`."
+            );
+        }
         (hash, written, false, Err(e)) => {
-            log::warn!("Non-fatal error during hashing.\
+            log::warn!(
+                "Non-fatal error during hashing.\
                 \n\tDebug info: written=`{written}`, hash=`{hash}`\
-                \n{e:?}");
+                \n{e:?}"
+            );
             Ok(hash)
-        },
+        }
     }
 }
 
 pub fn copy_and_optionally_hash<Src, Dst>(
     with_hash: bool,
-    mut src: Src,
-    mut dst: Dst,
+    src: Src,
+    dst: Dst,
 ) -> (Option<String>, usize, bool, Result<()>)
 where
     Src: Read + Seek,
