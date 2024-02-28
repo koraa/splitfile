@@ -9,7 +9,7 @@ use indicatif::ProgressBar;
 
 use crate::copy::{copy_and_optionally_hash, hash_data};
 use crate::index::Index;
-use crate::util::{pretty_path, try_read_to_string, uuidgen, NullBuffer};
+use crate::util::{pretty_path, try_read_to_string, uuidgen, NullBuffer, TruncateReadStream};
 
 pub(crate) mod copy;
 pub mod index;
@@ -41,10 +41,10 @@ struct WriteBackupCommand {
 
 #[derive(Clone, Args, Debug)]
 struct RestoreFromFragment {
-    #[arg(short = 's', long = "source-frag")]
+    #[arg(short = 's', long = "source")]
     pub source_fragment: String,
 
-    #[arg(short = 'd', long = "dest-frag")]
+    #[arg(short = 'd', long = "dest")]
     pub dest_fragment: Option<String>,
 
     #[arg(long)]
@@ -110,7 +110,11 @@ fn create(args: &CommandInvocation<CreateCommand>) -> Result<(ExitCode, Index)> 
 
     let (hash, len) = {
         let mut file = fs::File::open(path)?;
+
         let len = file.seek(SeekFrom::End(0)).ok();
+        if len.is_some() {
+            file.seek(SeekFrom::Start(0))?;
+        }
 
         match (with_hash, len) {
             // Determined len through seek and no hashing; this is quick
@@ -364,38 +368,74 @@ fn restore_from_fragment(args: &CommandInvocation<RestoreFromFragment>) -> Resul
     let src = idx.get_fragment_by_name(src)?;
     let dst = idx.get_fragment_by_name(dst.as_deref().unwrap_or("main"))?;
 
-    let ref_hash = with_hash.then(|| {
-        src.get(&idx).hashes.get(&HashIdentifier::Sha3_256)
-            .context("Source fragment does not contain a hash value. \
-                Try the --no-hash option if you did not intend to check the validity of your hashes.")
-    }).transpose()?;
+    let src_geo = src.get(&idx).geometry;
+    let dst_geo = dst.get(&idx).geometry;
 
-    let copy_geom = {
+    let copy_geo = {
         use std::cmp::{max, min};
-        let (sa, sz) = src.get(&idx).geometry.into();
-        let (da, dz) = src.get(&idx).geometry.into();
+        let (sa, sz) = src_geo.into();
+        let (da, dz) = dst_geo.into();
         Slice {
             start: max(sa, da),
             end: min(sz, dz),
         }
     };
 
-    if copy_geom.end > copy_geom.start {
+    let ref_hash = with_hash.then(|| {
+        if copy_geo == src_geo {
+            src.get(&idx).hashes.get(&HashIdentifier::Sha3_256)
+                .context("Source fragment does not contain a hash value. \
+                    Try the --no-hash option if you did not intend to check the validity of your hashes.")
+        } else if copy_geo == dst_geo {
+            dst.get(&idx).hashes.get(&HashIdentifier::Sha3_256)
+                .context("Destination fragment does not contain a hash value. \
+                    Try the --no-hash option if you did not intend to check the validity of your hashes.")
+        } else {
+            bail!("Cannot load hash value from either source or destination fragment because the overlapping \
+                segment ({copy_geo:?}) does not fully cover either the source segment ({src_geo:?}) or the \
+                destination segment ({dst_geo:?}).
+                Try the --no-hash option if you did not intend to check the validity of your hashes.")
+        }
+    }).transpose()?;
+
+    log::debug!("Source geometry: {:?}\n\
+        Dest geometry: {:?}\n\
+        Copy geometry: {:?}\n\
+        Src File off: {}\n\
+        Dst File off: {}",
+        src.get(&idx).geometry,
+        dst.get(&idx).geometry,
+        copy_geo,
+        copy_geo.start - src.get(&idx).geometry.start,
+        copy_geo.start - dst.get(&idx).geometry.start);
+
+    if copy_geo.end <= copy_geo.start {
         log::info!("Fragment regions do not overlap. No data copied!");
         return Ok(ExitCode::from(0));
     }
 
     let mut srcio = fs::File::open(src.get(&idx).filepath())?;
     srcio.seek(SeekFrom::Start(
-        copy_geom.start - src.get(&idx).geometry.start,
+        copy_geo.start - src.get(&idx).geometry.start,
     ))?;
+    let srcio = TruncateReadStream::new(srcio, copy_geo.len() as usize)?;
 
-    let mut dstio = fs::File::open(dst.get(&idx).filepath())?;
+    // TODO: Move into function
+    let mut dstio = fs::OpenOptions::new()
+        .read(false)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dst.get(&idx).filepath())?;
+    if let Err(e) = nix::unistd::ftruncate(&dstio, dst.get(&idx).geometry.len() as i64) {
+        log::warn!("Unable to truncate destination file: {e:?}");
+    }
+
     dstio.seek(SeekFrom::Start(
-        copy_geom.start - src.get(&idx).geometry.end,
+        copy_geo.start - dst.get(&idx).geometry.start,
     ))?;
 
-    let progress = ProgressBar::new(copy_geom.len()).with_message("Copying data");
+    let progress = ProgressBar::new(copy_geo.len()).with_message("Copying data");
 
     let (hash, written, fatal, res) =
         copy_and_optionally_hash(with_hash, srcio, progress.wrap_write(&mut dstio));
@@ -417,10 +457,11 @@ fn restore_from_fragment(args: &CommandInvocation<RestoreFromFragment>) -> Resul
     }
 
     ensure!(
-        written == copy_geom.len() as usize,
+        written == copy_geo.len() as usize,
         "Failed to copy all data, \
-        only copied {written} bytes for some reason.\
-        \n\tDebug data: hash=`{hash:?}`"
+        only copied {written} bytes instead of {} or some reason.\
+        \n\tDebug data: hash=`{hash:?}`",
+        copy_geo.len(),
     );
 
     ensure!(
@@ -444,7 +485,8 @@ fn validate_hash(args: &CommandInvocation<ValidateHash>) -> Result<ExitCode> {
         log::warn!("Source fragment is missing its reference hash. Will calculate the hash…");
     }
 
-    let mut fragio = fs::File::open(frag.get(&idx).filepath())?;
+    let fragio = fs::File::open(frag.get(&idx).filepath())?;
+    let mut fragio = TruncateReadStream::new(fragio, frag.get(&idx).geometry.len() as usize)?;
 
     let progress = ProgressBar::new(frag.get(&idx).geometry.len()).with_message("Calculating hash");
     let hash = hash_data(progress.wrap_read(&mut fragio))?;

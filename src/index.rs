@@ -189,7 +189,7 @@ pub struct Location {
     pub slice: Option<Slice>,
 }
 
-#[derive(Copy, Clone, Default, Serialize, Deserialize, Debug)]
+#[derive(Copy, Clone, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Slice {
     #[serde(default)]
     pub start: Offset,
